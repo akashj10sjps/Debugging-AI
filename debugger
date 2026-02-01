@@ -1,0 +1,230 @@
+from openai import OpenAI
+import json
+
+# Requires: pip install openai
+# And environment variable: OPENAI_API_KEY="sk-..."
+client = OpenAI()
+
+
+class ScannerAgent:
+    def run(self, state):
+        code = state["code"]
+
+        prompt = f"""
+You are a static analyzer for ANY programming language.
+
+1. Detect the programming language of the following code.
+2. List likely bugs or errors.
+3. DO NOT try to execute the code; reason statically.
+
+Return JSON ONLY with these keys:
+- "language": string, e.g. "Python", "C", "C++", "Java", "JavaScript", "TypeScript", "Go", "Rust", "C#", "PHP", etc.
+- "issues": a list of objects, each with:
+  - "line": approximate line number (1-based integer)
+  - "type": short label like "SyntaxError", "TypeError", "LogicError", "CompileError", etc.
+  - "msg": brief description.
+
+Code to analyze:
+"""
+
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a precise static analysis tool for multiple programming languages."
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+        )
+
+        content = response.choices[0].message.content
+
+        try:
+            data = json.loads(content)
+            language = data.get("language", "Unknown")
+            issues = data.get("issues", [])
+            if not isinstance(issues, list):
+                issues = []
+        except json.JSONDecodeError:
+            language = "Unknown"
+            issues = []
+
+        state["language"] = language
+        state["errors"] = issues
+        return state
+
+
+class FixerAgent:
+    def run(self, state):
+        code = state["code"]
+        language = state.get("language", "Unknown")
+        errors = state.get("errors", [])
+
+        prompt = f"""
+You are a senior {language} developer and code fixer.
+
+You receive:
+1. A code snippet in {language} (or best guess if not certain).
+2. A list of detected issues.
+
+Your job:
+- Produce a corrected version of the code that fixes the issues.
+- Preserve the original structure and style as much as possible.
+- Do not change the language.
+- Briefly explain what you changed and why.
+
+Input:
+
+Language (best guess): {language}
+
+Original code:
+Detected issues (JSON):
+Respond as JSON ONLY with keys:
+- "fixed_code": string, the corrected code in the SAME language as input.
+- "rationale": short explanation of changes.
+"""
+
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an expert multi-language programmer who fixes code carefully."
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+        )
+
+        content = response.choices[0].message.content
+
+        try:
+            parsed = json.loads(content)
+            fixed_code = parsed.get("fixed_code", code)
+            rationale = parsed.get("rationale", "No rationale provided.")
+        except json.JSONDecodeError:
+            fixed_code = code
+            rationale = "LLM response (could not parse JSON):" + content
+
+        state["proposed_fix"] = {
+            "fixed_code": fixed_code,
+            "rationale": rationale,
+        }
+        return state
+
+
+class ValidatorAgent:
+    def run(self, state):
+        original = state["code"]
+        language = state.get("language", "Unknown")
+        proposed = state.get("proposed_fix", {})
+        fixed_code = proposed.get("fixed_code", original)
+
+        prompt = f"""
+You are a strict but fair code reviewer and validator for {language}.
+
+Compare the original and fixed versions of this code.
+
+Original code ({language}):
+Fixed code ({language}):
+Tasks:
+1. Decide whether the fixed code plausibly resolves the original issues, without introducing obvious new bugs.
+2. If the language is ambiguous, still reason about correctness based on syntax and semantics.
+3. Provide a confidence score between 0 and 1.
+
+Respond as JSON ONLY with keys:
+- "is_valid": true or false
+- "comments": short explanation of your reasoning
+- "confidence": float between 0 and 1
+"""
+
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an experienced multi-language code reviewer and static analyzer."
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+        )
+
+        content = response.choices[0].message.content
+
+        try:
+            parsed = json.loads(content)
+            is_valid = bool(parsed.get("is_valid", False))
+            comments = parsed.get("comments", "No comments.")
+            confidence = float(parsed.get("confidence", 0.0))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            is_valid = False
+            comments = "Validator could not parse its own response."
+            confidence = 0.0
+
+        state["validator_feedback"] = {
+            "is_valid": is_valid,
+            "comments": comments,
+            "confidence": confidence,
+        }
+        return state
+
+
+class MultiAgentDebugger:
+    def _init_(self):
+        self.scanner = ScannerAgent()
+        self.fixer = FixerAgent()
+        self.validator = ValidatorAgent()
+
+    def run(self, code_snippet: str):
+        state = {
+            "code": code_snippet,
+            "language": None,
+            "errors": [],
+            "proposed_fix": None,
+            "validator_feedback": None,
+        }
+
+        state = self.scanner.run(state)
+        state = self.fixer.run(state)
+        state = self.validator.run(state)
+
+        return {
+            "language": state["language"],
+            "error_list": state["errors"],
+            "proposed_fix": state["proposed_fix"],
+            "validator_feedback": state["validator_feedback"],
+        }
+
+
+if __name__ == "__main_":
+    # Try with ANY language: Python, C, Java, JS, etc.
+    sample_code = """\
+// Example: C code with a bug
+#include <stdio.h>
+
+int main() {
+    int x = 10
+    printf("Value: %d", x);
+    return 0
+}
+"""
+
+    debugger = MultiAgentDebugger()
+    result = debugger.run(sample_code)
+
+    print("=== Detected language ===")
+    print(result["language"])
+
+    print("=== Error list ===")
+    for err in result["error_list"]:
+        print(err)
+
+    print("=== Proposed fix ===")
+    print(result["proposed_fix"]["fixed_code"])
+    print("Rationale:", result["proposed_fix"]["rationale"])
+
+    print("=== Validator feedback ===")
+    print(result["validator_feedback"])
